@@ -7,9 +7,12 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": [
-    "Other"
-  ],
+  "categories": ["Other", "Programming Languages"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RenownedOyster/npm-vuln-checker"
+  },
+  "icon": "icon.png",
   "activationEvents": [
     "onCommand:npmVulnChecker.scanDependencies",
     "workspaceContains:package.json",

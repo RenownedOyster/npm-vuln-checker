@@ -1,3 +1,5 @@
+![Cerberus logo](images/coverImage.png)
+
 # NPM Vulnerability Checker
 
 A VS Code extension that scans your workspace dependencies (direct and transitive) using [OSV.dev](https://osv.dev) and highlights packages with known vulnerabilities.

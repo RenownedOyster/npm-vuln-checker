@@ -1,6 +1,6 @@
 out/test/**
 src/**
+node_modules/**
 .vscode/**
-.gitignore
-vsc-extension-quickstart.md
 **/*.map
+**/*.ts
