@@ -52,6 +52,7 @@ interface CheckItem {
   version: string;
   isDirect: boolean;
   range: vscode.Range;
+  uri: vscode.Uri;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -64,7 +65,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.StatusBarAlignment.Left,
     100
   );
-  statusBarItem.text = '$(shield) NPM Vuln: Ready';
+  statusBarItem.text = '$(shield) Cerbe Ready';
   statusBarItem.tooltip =
     'Scan package.json for known vulnerabilities with OSV.dev';
   statusBarItem.command = 'cerbe.scanDependencies';
@@ -85,7 +86,7 @@ export function activate(context: vscode.ExtensionContext) {
     scanWorkspaceForVulns(diagnosticCollection);
   }
 
-  // 2. Watch for modifications to package.json
+  // 2. Watch for modifications to package.json (anywhere, monorepo-friendly)
   const pkgWatcher = vscode.workspace.createFileSystemWatcher('**/package.json');
 
   pkgWatcher.onDidChange(async () => {
@@ -99,7 +100,7 @@ export function activate(context: vscode.ExtensionContext) {
   pkgWatcher.onDidDelete(() => {
     diagnosticCollection.clear();
     if (statusBarItem) {
-      statusBarItem.text = '$(shield) NPM Vuln: No package.json';
+      statusBarItem.text = '$(shield) Cerbe No package.json';
       statusBarItem.tooltip = 'No package.json found in this workspace';
     }
   });
@@ -139,151 +140,149 @@ async function scanWorkspaceForVulns(
   diagnostics.clear();
 
   if (statusBarItem) {
-    statusBarItem.text = '$(sync~spin) NPM Vuln: Scanning...';
+    statusBarItem.text = '$(sync~spin) Cerbe Scanning...';
     statusBarItem.tooltip = 'Scanning dependencies with OSV.dev...';
     statusBarItem.show();
   }
 
   const workspaceFolders = vscode.workspace.workspaceFolders;
   if (!workspaceFolders || workspaceFolders.length === 0) {
-    vscode.window.showWarningMessage(
-      'NPM Vulnerability Checker: No workspace folder is open.'
-    );
+    vscode.window.showWarningMessage('Cerbe: No workspace folder is open.');
     if (statusBarItem) {
-      statusBarItem.text = '$(shield) NPM Vuln: No workspace';
+      statusBarItem.text = '$(shield) Cerbe No workspace';
       statusBarItem.tooltip = 'Open a folder to scan for vulnerabilities';
     }
     return;
   }
 
-  // Look for the root package.json (first match)
-  const [pkgUri] = await vscode.workspace.findFiles(
-    'package.json',
-    '**/node_modules/**',
-    1
+  // Find ALL package.json files (monorepo-friendly)
+  const pkgUris = await vscode.workspace.findFiles(
+    '**/package.json',
+    '**/node_modules/**'
   );
 
-  if (!pkgUri) {
+  if (!pkgUris || pkgUris.length === 0) {
     vscode.window.showWarningMessage(
-      'NPM Vulnerability Checker: No package.json found in the workspace root.'
+      'Cerbe: No package.json files found in the workspace.'
     );
     if (statusBarItem) {
-      statusBarItem.text = '$(shield) NPM Vuln: No package.json';
-      statusBarItem.tooltip = 'No package.json found in the workspace root';
+      statusBarItem.text = '$(shield) Cerbe No package.json';
+      statusBarItem.tooltip = 'No package.json found in this workspace';
     }
     return;
   }
 
   try {
-    const doc = await vscode.workspace.openTextDocument(pkgUri);
-    const text = doc.getText();
-    const pkgJson = JSON.parse(text) as PackageJson;
-
-    const directDeps = {
-      ...(pkgJson.dependencies ?? {}),
-      ...(pkgJson.devDependencies ?? {})
-    };
-
-    const directEntries = Object.entries(directDeps);
-    if (directEntries.length === 0) {
-      vscode.window.showInformationMessage(
-        'NPM Vulnerability Checker: No dependencies found in package.json.'
-      );
-      if (statusBarItem) {
-        statusBarItem.text = '$(shield) NPM Vuln: 0 deps';
-        statusBarItem.tooltip = 'No dependencies found in package.json';
-      }
-      return;
-    }
-
-    // Try to read transitive deps from any lockfile (npm, yarn, pnpm)
+    // Read lockfiles once for the whole workspace (global dependency graph)
     const lockDeps = await readLockfileDependencies();
 
-    // Build the list of packages to check (direct + transitive)
-    const checkMap = new Map<string, CheckItem>();
+    const checkItems: CheckItem[] = [];
+    const uniqueQueries = new Map<string, { name: string; version: string }>();
+    const docsByUri = new Map<string, vscode.TextDocument>();
 
-    // Direct deps: use lockfile version if available, otherwise normalized range
-    for (const [name, versionRange] of directEntries) {
-      const lockVersion = lockDeps?.get(name);
-      const normalizedFromPkg = normalizeVersion(versionRange);
-      const versionToUse = lockVersion ?? normalizedFromPkg;
+    // Build check items for each package.json (direct deps)
+    for (const pkgUri of pkgUris) {
+      const doc = await vscode.workspace.openTextDocument(pkgUri);
+      docsByUri.set(pkgUri.toString(), doc);
 
-      if (!versionToUse) {
-        continue;
+      const text = doc.getText();
+      const pkgJson = JSON.parse(text) as PackageJson;
+
+      const directDeps = {
+        ...(pkgJson.dependencies ?? {}),
+        ...(pkgJson.devDependencies ?? {})
+      };
+
+      const directEntries = Object.entries(directDeps);
+      if (directEntries.length === 0) {
+        continue; // no deps in this package.json; move on
       }
 
-      const key = cacheKey(name, versionToUse);
-      if (checkMap.has(key)) {
-        continue;
+      for (const [name, versionRange] of directEntries) {
+        const lockVersion = lockDeps?.get(name);
+        const normalizedFromPkg = normalizeVersion(versionRange);
+        const versionToUse = lockVersion ?? normalizedFromPkg;
+
+        if (!versionToUse) {
+          continue;
+        }
+
+        const range = findDependencyRangeInPackageJson(doc, name);
+        const item: CheckItem = {
+          name,
+          version: versionToUse,
+          isDirect: true,
+          range,
+          uri: pkgUri
+        };
+        checkItems.push(item);
+
+        const key = cacheKey(name, versionToUse);
+        if (!uniqueQueries.has(key)) {
+          uniqueQueries.set(key, { name, version: versionToUse });
+        }
       }
-
-      const range = findDependencyRangeInPackageJson(doc, name);
-
-      checkMap.set(key, {
-        name,
-        version: versionToUse,
-        isDirect: true,
-        range
-      });
     }
 
-    // Transitive deps: from lock files only
-    if (lockDeps) {
-      const firstLineRange = doc.lineAt(0).range;
+    // Add transitive deps (from lockfiles) once, attached to the first package.json
+    if (lockDeps && pkgUris.length > 0) {
+      const primaryUri = pkgUris[0];
+      let primaryDoc =
+        docsByUri.get(primaryUri.toString()) ??
+        (await vscode.workspace.openTextDocument(primaryUri));
+
+      const firstLineRange = primaryDoc.lineAt(0).range;
+
       for (const [name, version] of lockDeps.entries()) {
         const normalized = normalizeVersion(version) ?? version;
         if (!normalized) continue;
 
-        const key = cacheKey(name, normalized);
-        if (checkMap.has(key)) {
-          continue; // already covered as direct or seen
-        }
-
-        checkMap.set(key, {
+        const item: CheckItem = {
           name,
           version: normalized,
           isDirect: false,
-          // For transitive-only deps, attach diagnostic to first line of package.json
-          range: firstLineRange
-        });
+          range: firstLineRange,
+          uri: primaryUri
+        };
+        checkItems.push(item);
+
+        const key = cacheKey(name, normalized);
+        if (!uniqueQueries.has(key)) {
+          uniqueQueries.set(key, { name, version: normalized });
+        }
       }
     }
 
-    const checkItems = Array.from(checkMap.values());
     if (checkItems.length === 0) {
-      vscode.window.showInformationMessage(
-        'NPM Vulnerability Checker: No dependencies to scan.'
-      );
+      vscode.window.showInformationMessage('Cerbe: No dependencies to scan.');
       if (statusBarItem) {
-        statusBarItem.text = '$(shield) NPM Vuln: 0 deps';
+        statusBarItem.text = '$(shield) Cerbe 0 deps';
         statusBarItem.tooltip = 'No dependencies to scan';
       }
       return;
     }
 
-    // Parallel OSV queries with simple batching
+    // Parallel OSV queries for unique (name@version) pairs
     const results = new Map<string, OsvVulnerability[] | undefined>();
+    const uniqueList = Array.from(uniqueQueries.values());
 
-    for (let i = 0; i < checkItems.length; i += OSV_CONCURRENCY) {
-      const slice = checkItems.slice(i, i + OSV_CONCURRENCY);
-
-      const promises = slice.map(async (item) => {
-        const vulns = await queryOsvForPackage(item.name, item.version);
-        const key = cacheKey(item.name, item.version);
+    for (let i = 0; i < uniqueList.length; i += OSV_CONCURRENCY) {
+      const slice = uniqueList.slice(i, i + OSV_CONCURRENCY);
+      const promises = slice.map(async ({ name, version }) => {
+        const vulns = await queryOsvForPackage(name, version);
+        const key = cacheKey(name, version);
         results.set(key, vulns);
       });
-
       await Promise.all(promises);
     }
 
-    const allDiagnostics: vscode.Diagnostic[] = [];
+    // Build diagnostics per file
+    const diagnosticsByFile = new Map<string, vscode.Diagnostic[]>();
 
     for (const item of checkItems) {
       const key = cacheKey(item.name, item.version);
       const vulns = results.get(key);
-      if (!vulns || vulns.length === 0) {
-        continue;
-      }
+      if (!vulns || vulns.length === 0) continue;
 
       const first = vulns[0];
       const count = vulns.length;
@@ -322,11 +321,18 @@ async function scanWorkspaceForVulns(
         };
       }
 
-      allDiagnostics.push(diagnostic);
+      const fileKey = item.uri.toString();
+      const list = diagnosticsByFile.get(fileKey) ?? [];
+      list.push(diagnostic);
+      diagnosticsByFile.set(fileKey, list);
     }
 
-    diagnostics.set(pkgUri, allDiagnostics);
+    // Apply diagnostics to collection
+    for (const [uriStr, diags] of diagnosticsByFile.entries()) {
+      diagnostics.set(vscode.Uri.parse(uriStr), diags);
+    }
 
+    const allDiagnostics = Array.from(diagnosticsByFile.values()).flat();
     const transitiveIssueCount = allDiagnostics.filter((d) =>
       d.message.includes('(transitive dependency)')
     ).length;
@@ -334,19 +340,19 @@ async function scanWorkspaceForVulns(
 
     if (allDiagnostics.length === 0) {
       vscode.window.showInformationMessage(
-        'NPM Vulnerability Checker: No known vulnerabilities found for listed dependencies (according to OSV.dev).'
+        'Cerbe: No known vulnerabilities found for listed dependencies (according to OSV.dev).'
       );
       if (statusBarItem) {
-        statusBarItem.text = '$(shield) NPM Vuln: 0 issues';
+        statusBarItem.text = '$(shield) Cerbe 0 issues';
         statusBarItem.tooltip =
           'No known vulnerabilities found for listed dependencies';
       }
     } else {
       vscode.window.showWarningMessage(
-        `NPM Vulnerability Checker: Found ${allDiagnostics.length} vulnerable dependency entries (direct + transitive). Check package.json and the Problems panel.`
+        `Cerbe: Found ${allDiagnostics.length} vulnerable dependency entries across ${pkgUris.length} package.json file(s).`
       );
       if (statusBarItem) {
-        statusBarItem.text = `$(shield) NPM Vuln: ${allDiagnostics.length} issue${
+        statusBarItem.text = `$(shield) Cerbe ${allDiagnostics.length} issue${
           allDiagnostics.length === 1 ? '' : 's'
         }`;
         statusBarItem.tooltip = `Direct issues: ${directIssueCount}, transitive issues: ${transitiveIssueCount}`;
@@ -355,12 +361,10 @@ async function scanWorkspaceForVulns(
   } catch (err: any) {
     console.error('Error scanning dependencies', err);
     vscode.window.showErrorMessage(
-      `NPM Vulnerability Checker: Failed to scan dependencies: ${err?.message ?? String(
-        err
-      )}`
+      `Cerbe: Failed to scan dependencies: ${err?.message ?? String(err)}`
     );
     if (statusBarItem) {
-      statusBarItem.text = '$(error) NPM Vuln: Error';
+      statusBarItem.text = '$(error) Cerbe Error';
       statusBarItem.tooltip = 'Click to retry scanning dependencies';
     }
   }
@@ -384,25 +388,26 @@ async function readLockfileDependencies(): Promise<
   return acc.size ? acc : undefined;
 }
 
-// npm: package-lock.json
+// npm: package-lock.json (anywhere in workspace)
 async function readNpmLockInto(acc: Map<string, string>): Promise<void> {
-  const [lockUri] = await vscode.workspace.findFiles(
-    'package-lock.json',
-    '**/node_modules/**',
-    1
+  const lockUris = await vscode.workspace.findFiles(
+    '**/package-lock.json',
+    '**/node_modules/**'
   );
-  if (!lockUri) return;
+  if (!lockUris.length) return;
 
-  try {
-    const doc = await vscode.workspace.openTextDocument(lockUri);
-    const text = doc.getText();
-    const lockJson = JSON.parse(text) as any;
+  for (const lockUri of lockUris) {
+    try {
+      const doc = await vscode.workspace.openTextDocument(lockUri);
+      const text = doc.getText();
+      const lockJson = JSON.parse(text) as any;
 
-    if (lockJson.dependencies && typeof lockJson.dependencies === 'object') {
-      collectDepsFromNpmLock(lockJson.dependencies, acc);
+      if (lockJson.dependencies && typeof lockJson.dependencies === 'object') {
+        collectDepsFromNpmLock(lockJson.dependencies, acc);
+      }
+    } catch (err) {
+      console.warn('Failed to read package-lock.json:', err);
     }
-  } catch (err) {
-    console.warn('Failed to read package-lock.json:', err);
   }
 }
 
@@ -413,34 +418,42 @@ function collectDepsFromNpmLock(
   for (const [name, info] of Object.entries(deps)) {
     if (!info || typeof info !== 'object') continue;
 
-    const version = typeof (info as any).version === 'string'
-      ? (info as any).version
-      : undefined;
+    const version =
+      typeof (info as any).version === 'string'
+        ? (info as any).version
+        : undefined;
     if (version && !acc.has(name)) {
       acc.set(name, version);
     }
 
-    if ((info as any).dependencies && typeof (info as any).dependencies === 'object') {
-      collectDepsFromNpmLock((info as any).dependencies as Record<string, any>, acc);
+    if (
+      (info as any).dependencies &&
+      typeof (info as any).dependencies === 'object'
+    ) {
+      collectDepsFromNpmLock(
+        (info as any).dependencies as Record<string, any>,
+        acc
+      );
     }
   }
 }
 
-// yarn: yarn.lock (classic)
+// yarn: yarn.lock (classic, anywhere in workspace)
 async function readYarnLockInto(acc: Map<string, string>): Promise<void> {
-  const [yarnUri] = await vscode.workspace.findFiles(
-    'yarn.lock',
-    '**/node_modules/**',
-    1
+  const yarnUris = await vscode.workspace.findFiles(
+    '**/yarn.lock',
+    '**/node_modules/**'
   );
-  if (!yarnUri) return;
+  if (!yarnUris.length) return;
 
-  try {
-    const doc = await vscode.workspace.openTextDocument(yarnUri);
-    const text = doc.getText();
-    parseYarnLock(text, acc);
-  } catch (err) {
-    console.warn('Failed to read yarn.lock:', err);
+  for (const yarnUri of yarnUris) {
+    try {
+      const doc = await vscode.workspace.openTextDocument(yarnUri);
+      const text = doc.getText();
+      parseYarnLock(text, acc);
+    } catch (err) {
+      console.warn('Failed to read yarn.lock:', err);
+    }
   }
 }
 
@@ -520,21 +533,22 @@ function extractNameFromYarnSpec(spec: string): string | undefined {
   return spec.slice(0, atIndex);
 }
 
-// pnpm: pnpm-lock.yaml
+// pnpm: pnpm-lock.yaml (anywhere in workspace)
 async function readPnpmLockInto(acc: Map<string, string>): Promise<void> {
-  const [pnpmUri] = await vscode.workspace.findFiles(
-    'pnpm-lock.yaml',
-    '**/node_modules/**',
-    1
+  const pnpmUris = await vscode.workspace.findFiles(
+    '**/pnpm-lock.yaml',
+    '**/node_modules/**'
   );
-  if (!pnpmUri) return;
+  if (!pnpmUris.length) return;
 
-  try {
-    const doc = await vscode.workspace.openTextDocument(pnpmUri);
-    const text = doc.getText();
-    parsePnpmLock(text, acc);
-  } catch (err) {
-    console.warn('Failed to read pnpm-lock.yaml:', err);
+  for (const pnpmUri of pnpmUris) {
+    try {
+      const doc = await vscode.workspace.openTextDocument(pnpmUri);
+      const text = doc.getText();
+      parsePnpmLock(text, acc);
+    } catch (err) {
+      console.warn('Failed to read pnpm-lock.yaml:', err);
+    }
   }
 }
 
