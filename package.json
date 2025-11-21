@@ -12,7 +12,7 @@
     "type": "git",
     "url": "https://github.com/RenownedOyster/cerbe-npm-vuln-checker"
   },
-  "icon": "icon.png",
+  "icon": "images/icon.png",
   "activationEvents": [
     "onCommand:cerbe.scanDependencies",
     "workspaceContains:package.json",
