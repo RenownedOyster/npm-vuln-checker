@@ -1,0 +1,40 @@
+{
+  "name": "npm-vuln-checker",
+  "displayName": "NPM Vulnerability Checker",
+  "description": "Scans for vulnerable npm dependencies using OSV.dev (direct + transitive, lockfile-aware).",
+  "version": "0.0.1",
+  "publisher": "your-publisher-id",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:npmVulnChecker.scanDependencies",
+    "workspaceContains:package.json",
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "npmVulnChecker.scanDependencies",
+        "title": "NPM Vulnerability checker: Scan package.json"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "echo \"(no lint configured)\"",
+    "test": "echo \"(no tests configured)\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0",
+    "vsce": "^2.15.0"
+  }
+}
