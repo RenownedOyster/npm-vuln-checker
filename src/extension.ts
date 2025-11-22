@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 
 const OSV_API_URL = 'https://api.osv.dev/v1/query';
 const VULN_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const OSV_CONCURRENCY = 10; // max parallel OSV queries
+const OSV_CONCURRENCY = 10; // default max parallel OSV queries
 const DIAGNOSTIC_COLLECTION_ID = 'cerbe-npm-vuln-checker';
 
 interface PackageJson {
@@ -43,11 +44,23 @@ interface CacheEntry {
   fetchedAt: number;
 }
 
+/**
+ * Lockfile dependency info:
+ *  - version: resolved version from lockfile
+ *  - paths: one or more chains of dependency names that lead to this package
+ *    e.g. ["react", "scheduler"] or ["app", "react", "scheduler"]
+ */
+interface LockDepInfo {
+  version: string;
+  paths: string[][];
+}
+
 const vulnCache = new Map<string, CacheEntry>();
 
 let statusBarItem: vscode.StatusBarItem | undefined;
 let scanInProgress = false;
 let scanQueued = false;
+let scanDebounceTimer: NodeJS.Timeout | undefined;
 
 // Used for building diagnostics
 interface CheckItem {
@@ -56,6 +69,7 @@ interface CheckItem {
   isDirect: boolean;
   range: vscode.Range;
   uri: vscode.Uri;
+  paths?: string[][];
 }
 
 // Used for TreeView
@@ -77,10 +91,135 @@ type CerbeTreeNode =
       isDirect: boolean;
       vulns: OsvVulnerability[];
       range: vscode.Range;
+      paths?: string[][];
+    }
+  | {
+      kind: 'vuln';
+      uri: vscode.Uri;
+      packageName: string;
+      version: string;
+      isDirect: boolean;
+      vuln: OsvVulnerability;
     };
 
 let treeDataProvider: CerbeTreeProvider | undefined;
 let lastScanResults: ScanResultEntry[] = [];
+
+// ---- Config ----
+
+type AutoScanMode = 'all' | 'onSave' | 'manual';
+
+interface CerbeConfig {
+  autoScan: AutoScanMode;
+  scanTransitive: boolean;
+  maxConcurrency: number;
+  includeDevDependencies: boolean;
+  excludeGlobs: string[];
+}
+
+const getConfig = (): CerbeConfig => {
+  const cfg = vscode.workspace.getConfiguration('cerbe');
+
+  const autoScan = cfg.get<AutoScanMode>('autoScan', 'all');
+  const scanTransitive = cfg.get<boolean>('scanTransitive', true);
+  const maxConcurrencyRaw = cfg.get<number>('maxConcurrency', OSV_CONCURRENCY);
+  const includeDevDependencies = cfg.get<boolean>(
+    'includeDevDependencies',
+    true
+  );
+  const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
+
+  const maxConcurrency =
+    typeof maxConcurrencyRaw === 'number' && maxConcurrencyRaw > 0
+      ? Math.floor(maxConcurrencyRaw)
+      : OSV_CONCURRENCY;
+
+  return {
+    autoScan,
+    scanTransitive,
+    maxConcurrency,
+    includeDevDependencies,
+    excludeGlobs
+  };
+};
+
+const buildExcludeGlob = (userGlobs: string[]): string => {
+  const patterns = ['**/node_modules/**', ...userGlobs.filter(Boolean)];
+  if (patterns.length === 1) {
+    return patterns[0];
+  }
+  return `{${patterns.join(',')}}`;
+};
+
+// ---- Severity helpers ----
+
+type SeverityLevel = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';
+
+interface SeverityInfo {
+  level: SeverityLevel;
+  score?: number;
+}
+
+const getMaxSeverityInfo = (vulns: OsvVulnerability[]): SeverityInfo => {
+  let best: SeverityInfo = { level: 'UNKNOWN' };
+  let bestRank = 0;
+
+  vulns.forEach((v) => {
+    (v.severity ?? []).forEach((s) => {
+      if (!s.score) {
+        return;
+      }
+      const score = parseFloat(s.score);
+      if (Number.isNaN(score)) {
+        return;
+      }
+
+      const level: SeverityLevel =
+        score >= 9
+          ? 'CRITICAL'
+          : score >= 7
+          ? 'HIGH'
+          : score >= 4
+          ? 'MEDIUM'
+          : score > 0
+          ? 'LOW'
+          : 'UNKNOWN';
+
+      const rank =
+        level === 'CRITICAL'
+          ? 4
+          : level === 'HIGH'
+          ? 3
+          : level === 'MEDIUM'
+          ? 2
+          : level === 'LOW'
+          ? 1
+          : 0;
+
+      if (rank > bestRank) {
+        bestRank = rank;
+        best = { level, score };
+      }
+    });
+  });
+
+  return best;
+};
+
+const getSeverityPrefix = (level: SeverityLevel): string => {
+  switch (level) {
+    case 'CRITICAL':
+      return '🛑';
+    case 'HIGH':
+      return '🔴';
+    case 'MEDIUM':
+      return '🟠';
+    case 'LOW':
+      return '🟡';
+    default:
+      return '⚪️';
+  }
+};
 
 // ---- TreeView provider ----
 
@@ -105,7 +244,15 @@ class CerbeTreeProvider
 
   getTreeItem = (element: CerbeTreeNode): vscode.TreeItem => {
     if (element.kind === 'file') {
-      const label = `${vscode.workspace.asRelativePath(
+      const fileResults = this.results.filter(
+        (r) => r.uri.toString() === element.uri.toString()
+      );
+      const severities = getMaxSeverityInfo(
+        fileResults.flatMap((r) => r.vulns)
+      );
+      const prefix = getSeverityPrefix(severities.level);
+
+      const label = `${prefix} ${vscode.workspace.asRelativePath(
         element.uri
       )} (${element.issueCount})`;
       const item = new vscode.TreeItem(
@@ -114,16 +261,99 @@ class CerbeTreeProvider
       );
       item.tooltip = `${element.issueCount} vulnerable package${
         element.issueCount === 1 ? '' : 's'
-      }`;
+      } • max severity: ${severities.level}`;
       return item;
     }
 
-    const issueCount = element.vulns.length;
-    const directText = element.isDirect ? 'direct' : 'transitive';
-    const label = `${element.packageName}@${element.version}`;
-    const description = `${issueCount} vuln${
-      issueCount === 1 ? '' : 's'
-    } • ${directText}`;
+    if (element.kind === 'package') {
+      const issueCount = element.vulns.length;
+      const directText = element.isDirect ? 'direct' : 'transitive';
+      const severityInfo = getMaxSeverityInfo(element.vulns);
+      const severityPrefix = getSeverityPrefix(severityInfo.level);
+
+      const baseLabel = `${element.packageName}@${element.version}`;
+      const label = `${severityPrefix} ${baseLabel}`;
+
+      let description = `[${severityInfo.level}] ${issueCount} vuln${
+        issueCount === 1 ? '' : 's'
+      } • ${directText}`;
+
+      const paths = element.paths;
+      if (!element.isDirect && paths && paths.length > 0) {
+        const firstPath = paths[0];
+        if (firstPath.length > 1) {
+          const introducers = firstPath.slice(0, -1).join(' > ');
+          if (introducers) {
+            description += ` via ${introducers}`;
+          }
+        }
+      }
+
+      const item = new vscode.TreeItem(
+        label,
+        vscode.TreeItemCollapsibleState.Collapsed
+      );
+      item.description = description;
+
+      const tooltipLines: string[] = [
+        baseLabel,
+        element.isDirect ? 'Direct dependency' : 'Transitive dependency',
+        `Max severity: ${severityInfo.level}`,
+        ''
+      ];
+
+      const pathsForTooltip = paths ?? [];
+      if (!element.isDirect && pathsForTooltip.length > 0) {
+        tooltipLines.push('Introduced via:');
+        pathsForTooltip.slice(0, 3).forEach((p) => {
+          tooltipLines.push(`  • ${p.join(' > ')}`);
+        });
+        if (pathsForTooltip.length > 3) {
+          tooltipLines.push(
+            `  • (+${pathsForTooltip.length - 3} more path${
+              pathsForTooltip.length - 3 === 1 ? '' : 's'
+            })`
+          );
+        }
+        tooltipLines.push('');
+      }
+
+      tooltipLines.push(
+        ...element.vulns
+          .slice(0, 3)
+          .map(
+            (v) =>
+              `${v.id ?? 'Unknown'}: ${v.summary ?? ''}`.trim()
+          )
+      );
+
+      item.tooltip = tooltipLines.join('\n');
+
+      item.command = {
+        command: 'vscode.open',
+        title: 'Open package.json',
+        arguments: [
+          element.uri,
+          {
+            selection: new vscode.Range(
+              element.range.start,
+              element.range.end
+            )
+          }
+        ]
+      };
+
+      return item;
+    }
+
+    // Vulnerability node
+    const severityInfo = getMaxSeverityInfo([element.vuln]);
+    const severityPrefix = getSeverityPrefix(severityInfo.level);
+
+    const id = element.vuln.id ?? 'Unknown';
+    const baseLabel = id;
+    const label = `${severityPrefix} ${baseLabel}`;
+    const description = element.vuln.summary ?? '';
 
     const item = new vscode.TreeItem(
       label,
@@ -131,29 +361,31 @@ class CerbeTreeProvider
     );
     item.description = description;
 
-    const tooltipLines = [
-      `${label}`,
-      element.isDirect ? 'Direct dependency' : 'Transitive dependency',
+    const tooltipLines: string[] = [
+      `Vulnerability: ${id}`,
+      `Severity: ${severityInfo.level}${
+        severityInfo.score != null ? ` (CVSS ${severityInfo.score})` : ''
+      }`,
       '',
-      ...element.vulns
-        .slice(0, 3)
-        .map((v) => `${v.id ?? 'Unknown'}: ${v.summary ?? ''}`)
+      element.vuln.summary ?? '',
+      '',
+      `Package: ${element.packageName}@${element.version}`,
+      element.isDirect ? 'Direct dependency' : 'Transitive dependency'
     ];
+
     item.tooltip = tooltipLines.join('\n');
 
-    item.command = {
-      command: 'vscode.open',
-      title: 'Open package.json',
-      arguments: [
-        element.uri,
-        {
-          selection: new vscode.Range(
-            element.range.start,
-            element.range.end
+    if (element.vuln.id) {
+      item.command = {
+        command: 'vscode.open',
+        title: 'Open OSV entry',
+        arguments: [
+          vscode.Uri.parse(
+            `https://osv.dev/vulnerability/${element.vuln.id}`
           )
-        }
-      ]
-    };
+        ]
+      };
+    }
 
     return item;
   };
@@ -190,7 +422,7 @@ class CerbeTreeProvider
     }
 
     if (element.kind === 'file') {
-      // Child level: vulnerable packages under this package.json
+      // Package level: vulnerable packages under this package.json
       const fileResults = this.results.filter(
         (r) => r.uri.toString() === element.uri.toString()
       );
@@ -202,7 +434,20 @@ class CerbeTreeProvider
         version: r.version,
         isDirect: r.isDirect,
         vulns: r.vulns,
-        range: r.range
+        range: r.range,
+        paths: r.paths
+      }));
+    }
+
+    if (element.kind === 'package') {
+      // Vulnerability level: vulns under this package
+      return element.vulns.map((v) => ({
+        kind: 'vuln' as const,
+        uri: element.uri,
+        packageName: element.packageName,
+        version: element.version,
+        isDirect: element.isDirect,
+        vuln: v
       }));
     }
 
@@ -228,13 +473,26 @@ export const activate = (context: vscode.ExtensionContext) => {
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
-  const triggerScan = () => {
-    void requestScan(diagnosticCollection);
+  const scheduleScan = () => {
+    const config = getConfig();
+    if (config.autoScan === 'manual') {
+      return;
+    }
+    if (scanDebounceTimer) {
+      clearTimeout(scanDebounceTimer);
+    }
+    scanDebounceTimer = setTimeout(() => {
+      scanDebounceTimer = undefined;
+      void requestScan(diagnosticCollection);
+    }, 500);
   };
 
   const scanCommand = vscode.commands.registerCommand(
     'cerbe.scanDependencies',
-    triggerScan
+    () => {
+      // Manual scan always runs, regardless of autoScan mode
+      void requestScan(diagnosticCollection);
+    }
   );
   context.subscriptions.push(scanCommand);
 
@@ -246,16 +504,15 @@ export const activate = (context: vscode.ExtensionContext) => {
   });
   context.subscriptions.push(treeView);
 
-  if (vscode.workspace.workspaceFolders?.length) {
-    triggerScan();
+  const config = getConfig();
+  if (vscode.workspace.workspaceFolders?.length && config.autoScan === 'all') {
+    scheduleScan();
   }
 
   const pkgWatcher = vscode.workspace.createFileSystemWatcher('**/package.json');
 
-  pkgWatcher.onDidChange(triggerScan);
-
-  pkgWatcher.onDidCreate(triggerScan);
-
+  pkgWatcher.onDidChange(scheduleScan);
+  pkgWatcher.onDidCreate(scheduleScan);
   pkgWatcher.onDidDelete(() => {
     diagnosticCollection.clear();
     lastScanResults = [];
@@ -275,9 +532,9 @@ export const activate = (context: vscode.ExtensionContext) => {
   ];
 
   lockWatchers.forEach((watcher) => {
-    watcher.onDidChange(triggerScan);
-    watcher.onDidCreate(triggerScan);
-    watcher.onDidDelete(triggerScan);
+    watcher.onDidChange(scheduleScan);
+    watcher.onDidCreate(scheduleScan);
+    watcher.onDidDelete(scheduleScan);
     context.subscriptions.push(watcher);
   });
 };
@@ -328,9 +585,12 @@ const scanWorkspaceForVulns = async (
     return;
   }
 
+  const config = getConfig();
+  const excludeGlob = buildExcludeGlob(config.excludeGlobs ?? []);
+
   const pkgUris = await vscode.workspace.findFiles(
     '**/package.json',
-    '**/node_modules/**'
+    excludeGlob
   );
 
   if (!pkgUris || pkgUris.length === 0) {
@@ -345,11 +605,15 @@ const scanWorkspaceForVulns = async (
   }
 
   try {
-    const lockDeps = await readLockfileDependencies();
+    const lockDepsByOwner = await readLockfileDependencies(
+      pkgUris,
+      excludeGlob
+    );
 
     const checkItems: CheckItem[] = [];
     const uniqueQueries = new Map<string, { name: string; version: string }>();
     const docsByUri = new Map<string, vscode.TextDocument>();
+    const directItemKeys = new Set<string>();
 
     await Promise.all(
       pkgUris.map(async (pkgUri) => {
@@ -361,18 +625,36 @@ const scanWorkspaceForVulns = async (
           return;
         }
 
-        const directDeps = {
-          ...(pkgJson.dependencies ?? {}),
-          ...(pkgJson.devDependencies ?? {})
-        };
+        // --- FIX: explicitly collect dependencies + devDependencies ---
+        const dependencies = pkgJson.dependencies ?? {};
+        const devDependencies = pkgJson.devDependencies ?? {};
 
-        const directEntries = Object.entries(directDeps);
+        const directEntries: Array<[string, string]> = [];
+
+        // Always include "dependencies"
+        Object.entries(dependencies).forEach(([name, version]) => {
+          directEntries.push([name, version]);
+        });
+
+        // Optionally include "devDependencies"; do NOT overwrite deps
+        if (config.includeDevDependencies) {
+          Object.entries(devDependencies).forEach(([name, version]) => {
+            if (!(name in dependencies)) {
+              directEntries.push([name, version]);
+            }
+          });
+        }
+        // --- end FIX ---
+
         if (directEntries.length === 0) {
           return;
         }
 
+        const ownerLockDeps = lockDepsByOwner?.get(pkgUri.toString());
+
         directEntries.forEach(([name, versionRange]) => {
-          const lockVersion = lockDeps?.get(name);
+          const lockInfo = ownerLockDeps?.get(name);
+          const lockVersion = lockInfo?.version;
           const normalizedFromPkg = normalizeVersion(versionRange);
           const versionToUse = lockVersion ?? normalizedFromPkg;
 
@@ -381,6 +663,9 @@ const scanWorkspaceForVulns = async (
           }
 
           const range = findDependencyRangeInPackageJson(doc, name);
+          const itemKey = `${pkgUri.toString()}::${name}@${versionToUse}`;
+          directItemKeys.add(itemKey);
+
           const item: CheckItem = {
             name,
             version: versionToUse,
@@ -391,37 +676,55 @@ const scanWorkspaceForVulns = async (
           checkItems.push(item);
 
           const key = cacheKey(name, versionToUse);
-          uniqueQueries.set(key, { name, version: versionToUse });
+          if (!uniqueQueries.has(key)) {
+            uniqueQueries.set(key, { name, version: versionToUse });
+          }
         });
       })
     );
 
-    if (lockDeps && pkgUris.length > 0) {
-      const primaryUri = pkgUris[0];
-      const primaryDoc =
-        docsByUri.get(primaryUri.toString()) ??
-        (await vscode.workspace.openTextDocument(primaryUri));
-
-      const firstLineRange = primaryDoc.lineAt(0).range;
-
-      Array.from(lockDeps.entries()).forEach(([name, version]) => {
-        const normalized = normalizeVersion(version) ?? version;
-        if (!normalized) {
-          return;
+    if (lockDepsByOwner && config.scanTransitive) {
+      for (const pkgUri of pkgUris) {
+        const ownerKey = pkgUri.toString();
+        const ownerLockDeps = lockDepsByOwner.get(ownerKey);
+        if (!ownerLockDeps) {
+          continue;
         }
 
-        const item: CheckItem = {
-          name,
-          version: normalized,
-          isDirect: false,
-          range: firstLineRange,
-          uri: primaryUri
-        };
-        checkItems.push(item);
+        const doc =
+          docsByUri.get(ownerKey) ??
+          (await vscode.workspace.openTextDocument(pkgUri));
+        docsByUri.set(ownerKey, doc);
+        const firstLineRange = doc.lineAt(0).range;
 
-        const key = cacheKey(name, normalized);
-        uniqueQueries.set(key, { name, version: normalized });
-      });
+        ownerLockDeps.forEach((info, name) => {
+          const version = info.version;
+          const normalized = normalizeVersion(version) ?? version;
+          if (!normalized) {
+            return;
+          }
+
+          const itemKey = `${ownerKey}::${name}@${normalized}`;
+          if (directItemKeys.has(itemKey)) {
+            return;
+          }
+
+          const item: CheckItem = {
+            name,
+            version: normalized,
+            isDirect: false,
+            range: firstLineRange,
+            uri: pkgUri,
+            paths: info.paths
+          };
+          checkItems.push(item);
+
+          const qKey = cacheKey(name, normalized);
+          if (!uniqueQueries.has(qKey)) {
+            uniqueQueries.set(qKey, { name, version: normalized });
+          }
+        });
+      }
     }
 
     if (checkItems.length === 0) {
@@ -432,11 +735,13 @@ const scanWorkspaceForVulns = async (
 
     const results = new Map<string, OsvVulnerability[] | undefined>();
     const uniqueList = Array.from(uniqueQueries.values());
-    const chunkCount = Math.ceil(uniqueList.length / OSV_CONCURRENCY);
+
+    const maxConcurrency = config.maxConcurrency;
+    const chunkCount = Math.ceil(uniqueList.length / maxConcurrency);
     const chunks = Array.from({ length: chunkCount }, (_, idx) =>
       uniqueList.slice(
-        idx * OSV_CONCURRENCY,
-        (idx + 1) * OSV_CONCURRENCY
+        idx * maxConcurrency,
+        (idx + 1) * maxConcurrency
       )
     );
 
@@ -465,10 +770,12 @@ const scanWorkspaceForVulns = async (
         return acc;
       }
 
+      const severityInfo = getMaxSeverityInfo(vulns);
       const first = vulns[0];
       const count = vulns.length;
 
       const messageParts: string[] = [
+        `[${severityInfo.level}]`,
         `${item.name}@${item.version} has ${count} known vulnerability${
           count > 1 ? 'ies' : 'y'
         } in OSV.dev.`
@@ -555,31 +862,68 @@ const scanWorkspaceForVulns = async (
   }
 };
 
-// ---- Lockfile helpers (transitive deps) ----
+// ---- Lockfile helpers (transitive deps + monorepo mapping) ----
 
 /**
- * Reads any available lockfile (npm, yarn, pnpm) and flattens all dependencies
- * (including transitive) into a map of name -> version.
+ * Reads any available lockfile (npm, yarn, pnpm) and groups dependencies
+ * by the nearest owning package.json, returning:
+ *
+ *   ownerPkgUri.toString() -> Map<packageName, LockDepInfo>
  */
-const readLockfileDependencies = async (): Promise<
-  Map<string, string> | undefined
-> => {
-  const acc = new Map<string, string>();
+const readLockfileDependencies = async (
+  pkgUris: vscode.Uri[],
+  excludeGlob: string
+): Promise<Map<string, Map<string, LockDepInfo>> | undefined> => {
+  if (!pkgUris.length) {
+    return undefined;
+  }
+
+  const byOwner = new Map<string, Map<string, LockDepInfo>>();
+
+  const pkgDirToUri = new Map<string, vscode.Uri>();
+  pkgUris.forEach((uri) => {
+    const dir = getDirname(uri);
+    pkgDirToUri.set(dir, uri);
+  });
 
   await Promise.all([
-    readNpmLockInto(acc),
-    readYarnLockInto(acc),
-    readPnpmLockInto(acc)
+    readNpmLockInto(byOwner, pkgDirToUri, excludeGlob),
+    readYarnLockInto(byOwner, pkgDirToUri, excludeGlob),
+    readPnpmLockInto(byOwner, pkgDirToUri, excludeGlob)
   ]);
 
-  return acc.size ? acc : undefined;
+  return byOwner.size ? byOwner : undefined;
 };
 
-// npm: package-lock.json (anywhere in workspace)
-const readNpmLockInto = async (acc: Map<string, string>): Promise<void> => {
+const getDirname = (uri: vscode.Uri): string => path.dirname(uri.fsPath);
+
+const findOwnerForLockfile = (
+  lockUri: vscode.Uri,
+  pkgDirToUri: Map<string, vscode.Uri>
+): vscode.Uri | undefined => {
+  let dir = getDirname(lockUri);
+  while (true) {
+    const owner = pkgDirToUri.get(dir);
+    if (owner) {
+      return owner;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      return undefined;
+    }
+    dir = parent;
+  }
+};
+
+// npm: package-lock.json
+const readNpmLockInto = async (
+  byOwner: Map<string, Map<string, LockDepInfo>>,
+  pkgDirToUri: Map<string, vscode.Uri>,
+  excludeGlob: string
+): Promise<void> => {
   const lockUris = await vscode.workspace.findFiles(
     '**/package-lock.json',
-    '**/node_modules/**'
+    excludeGlob
   );
   if (!lockUris.length) {
     return;
@@ -587,12 +931,28 @@ const readNpmLockInto = async (acc: Map<string, string>): Promise<void> => {
 
   await Promise.all(
     lockUris.map(async (lockUri) => {
+      const ownerUri = findOwnerForLockfile(lockUri, pkgDirToUri);
+      if (!ownerUri) {
+        return;
+      }
+      const ownerKey = ownerUri.toString();
+      const ownerDeps =
+        byOwner.get(ownerKey) ?? new Map<string, LockDepInfo>();
+      byOwner.set(ownerKey, ownerDeps);
+
       try {
         const doc = await vscode.workspace.openTextDocument(lockUri);
         const lockJson = JSON.parse(doc.getText()) as any;
 
-        if (lockJson.dependencies && typeof lockJson.dependencies === 'object') {
-          collectDepsFromNpmLock(lockJson.dependencies, acc);
+        if (
+          lockJson.dependencies &&
+          typeof lockJson.dependencies === 'object'
+        ) {
+          collectDepsFromNpmLock(
+            lockJson.dependencies,
+            ownerDeps,
+            []
+          );
         }
       } catch (err) {
         console.warn('Failed to read package-lock.json:', err);
@@ -603,7 +963,8 @@ const readNpmLockInto = async (acc: Map<string, string>): Promise<void> => {
 
 const collectDepsFromNpmLock = (
   deps: Record<string, any>,
-  acc: Map<string, string>
+  acc: Map<string, LockDepInfo>,
+  parentPath: string[]
 ) => {
   Object.entries(deps).forEach(([name, info]) => {
     if (!info || typeof info !== 'object') {
@@ -614,8 +975,20 @@ const collectDepsFromNpmLock = (
       typeof (info as any).version === 'string'
         ? (info as any).version
         : undefined;
-    if (version && !acc.has(name)) {
-      acc.set(name, version);
+    const newPath = [...parentPath, name];
+
+    if (version) {
+      const existing = acc.get(name);
+      if (!existing) {
+        acc.set(name, {
+          version,
+          paths: [newPath]
+        });
+      } else if (existing.version === version) {
+        existing.paths.push(newPath);
+      } else {
+        existing.paths.push(newPath);
+      }
     }
 
     if (
@@ -624,17 +997,22 @@ const collectDepsFromNpmLock = (
     ) {
       collectDepsFromNpmLock(
         (info as any).dependencies as Record<string, any>,
-        acc
+        acc,
+        newPath
       );
     }
   });
 };
 
-// yarn: yarn.lock (classic, anywhere in workspace)
-const readYarnLockInto = async (acc: Map<string, string>): Promise<void> => {
+// yarn: yarn.lock
+const readYarnLockInto = async (
+  byOwner: Map<string, Map<string, LockDepInfo>>,
+  pkgDirToUri: Map<string, vscode.Uri>,
+  excludeGlob: string
+): Promise<void> => {
   const yarnUris = await vscode.workspace.findFiles(
     '**/yarn.lock',
-    '**/node_modules/**'
+    excludeGlob
   );
   if (!yarnUris.length) {
     return;
@@ -642,9 +1020,18 @@ const readYarnLockInto = async (acc: Map<string, string>): Promise<void> => {
 
   await Promise.all(
     yarnUris.map(async (yarnUri) => {
+      const ownerUri = findOwnerForLockfile(yarnUri, pkgDirToUri);
+      if (!ownerUri) {
+        return;
+      }
+      const ownerKey = ownerUri.toString();
+      const ownerDeps =
+        byOwner.get(ownerKey) ?? new Map<string, LockDepInfo>();
+      byOwner.set(ownerKey, ownerDeps);
+
       try {
         const doc = await vscode.workspace.openTextDocument(yarnUri);
-        parseYarnLock(doc.getText(), acc);
+        parseYarnLock(doc.getText(), ownerDeps);
       } catch (err) {
         console.warn('Failed to read yarn.lock:', err);
       }
@@ -658,8 +1045,10 @@ const readYarnLockInto = async (acc: Map<string, string>): Promise<void> => {
  *
  * "pkg-name@^1.0.0":
  *   version "1.2.3"
+ *
+ * For now, we record simple paths: ["pkg-name"].
  */
-const parseYarnLock = (text: string, acc: Map<string, string>) => {
+const parseYarnLock = (text: string, acc: Map<string, LockDepInfo>) => {
   const lines = text.split(/\r?\n/);
   let currentNames: string[] = [];
   let currentVersion: string | undefined;
@@ -671,10 +1060,20 @@ const parseYarnLock = (text: string, acc: Map<string, string>) => {
     const version = currentVersion;
     currentNames.forEach((spec) => {
       const name = extractNameFromYarnSpec(spec);
-      if (!name || acc.has(name)) {
+      if (!name) {
         return;
       }
-      acc.set(name, version);
+      const existing = acc.get(name);
+      if (!existing) {
+        acc.set(name, {
+          version,
+          paths: [[name]]
+        });
+      } else if (existing.version === version) {
+        existing.paths.push([name]);
+      } else {
+        existing.paths.push([name]);
+      }
     });
     currentNames = [];
     currentVersion = undefined;
@@ -686,7 +1085,9 @@ const parseYarnLock = (text: string, acc: Map<string, string>) => {
     if (line.endsWith(':') && !line.startsWith('  ') && line !== 'resolution:') {
       flush();
       const keyPart = line.slice(0, -1).trim();
-      currentNames = keyPart.split(/,\s*/).map((s) => s.replace(/^"|"$/g, ''));
+      currentNames = keyPart
+        .split(/,\s*/)
+        .map((s) => s.replace(/^"|"$/g, ''));
       return;
     }
 
@@ -718,11 +1119,15 @@ const extractNameFromYarnSpec = (spec: string): string | undefined => {
   return atIndex === -1 ? spec : spec.slice(0, atIndex);
 };
 
-// pnpm: pnpm-lock.yaml (anywhere in workspace)
-const readPnpmLockInto = async (acc: Map<string, string>): Promise<void> => {
+// pnpm: pnpm-lock.yaml
+const readPnpmLockInto = async (
+  byOwner: Map<string, Map<string, LockDepInfo>>,
+  pkgDirToUri: Map<string, vscode.Uri>,
+  excludeGlob: string
+): Promise<void> => {
   const pnpmUris = await vscode.workspace.findFiles(
     '**/pnpm-lock.yaml',
-    '**/node_modules/**'
+    excludeGlob
   );
   if (!pnpmUris.length) {
     return;
@@ -730,9 +1135,18 @@ const readPnpmLockInto = async (acc: Map<string, string>): Promise<void> => {
 
   await Promise.all(
     pnpmUris.map(async (pnpmUri) => {
+      const ownerUri = findOwnerForLockfile(pnpmUri, pkgDirToUri);
+      if (!ownerUri) {
+        return;
+      }
+      const ownerKey = ownerUri.toString();
+      const ownerDeps =
+        byOwner.get(ownerKey) ?? new Map<string, LockDepInfo>();
+      byOwner.set(ownerKey, ownerDeps);
+
       try {
         const doc = await vscode.workspace.openTextDocument(pnpmUri);
-        parsePnpmLock(doc.getText(), acc);
+        parsePnpmLock(doc.getText(), ownerDeps);
       } catch (err) {
         console.warn('Failed to read pnpm-lock.yaml:', err);
       }
@@ -748,8 +1162,10 @@ const readPnpmLockInto = async (acc: Map<string, string>): Promise<void> => {
  *   /@scope/name/4.5.6:
  *
  * and extract name + version from the path.
+ *
+ * For now, we record simple paths: ["name"] or ["@scope/name"].
  */
-const parsePnpmLock = (text: string, acc: Map<string, string>) => {
+const parsePnpmLock = (text: string, acc: Map<string, LockDepInfo>) => {
   const lines = text.split(/\r?\n/);
   let inPackagesSection = false;
 
@@ -776,8 +1192,16 @@ const parsePnpmLock = (text: string, acc: Map<string, string>) => {
     const fullName = match[1];
     const version = match[2];
 
-    if (!acc.has(fullName)) {
-      acc.set(fullName, version);
+    const existing = acc.get(fullName);
+    if (!existing) {
+      acc.set(fullName, {
+        version,
+        paths: [[fullName]]
+      });
+    } else if (existing.version === version) {
+      existing.paths.push([fullName]);
+    } else {
+      existing.paths.push([fullName]);
     }
   });
 };

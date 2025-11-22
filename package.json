@@ -2,7 +2,7 @@
   "name": "cerbe-npm-vuln-checker",
   "displayName": "Cerbe: NPM Vulnerability Checker",
   "description": "Scans for vulnerable npm dependencies using OSV.dev (direct + transitive, lockfile-aware).",
-  "version": "0.1.4",
+  "version": "1.0.1",
   "publisher": "RenownedOyster",
   "license": "MIT",
   "engines": {
@@ -34,7 +34,40 @@
         "command": "cerbe.scanDependencies",
         "title": "Cerbe NPM Vulnerability checker: Scan package.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Cerbe",
+      "properties": {
+        "cerbe.autoScan": {
+          "type": "string",
+          "enum": ["all", "onSave", "manual"],
+          "default": "all",
+          "description": "When Cerbe should automatically scan for vulnerabilities."
+        },
+        "cerbe.scanTransitive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Scan transitive dependencies via lockfiles."
+        },
+        "cerbe.maxConcurrency": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "Maximum number of parallel OSV queries."
+        },
+        "cerbe.includeDevDependencies": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include devDependencies in vulnerability scans."
+        },
+        "cerbe.excludeGlobs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Additional glob patterns to exclude from scanning (node_modules is always excluded)."
+        }
+      }
+  }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

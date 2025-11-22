@@ -6,9 +6,9 @@
 ![Installs](https://img.shields.io/visual-studio-marketplace/i/RenownedOyster.cerbe)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-Cerbe is a VS Code extension that scans your workspace dependencies—direct and transitive—using the OSV.dev security database. Vulnerable packages are highlighted directly inside your `package.json` files, making supply-chain risks visible instantly.
+Cerbe is a VS Code extension that scans your workspace dependencies — direct and transitive — using the [OSV.dev](https://osv.dev) security database. Vulnerable packages are highlighted directly inside your `package.json` files and surfaced in a dedicated sidebar view, giving you instant visibility into supply-chain risk.
 
-Cerbe is monorepo-friendly, performs parallel OSV queries, and uses background caching for fast rescans.
+Cerbe is monorepo-aware, performs parallel OSV queries, and uses background caching for fast rescans.
 
 ---
 
@@ -16,57 +16,117 @@ Cerbe is monorepo-friendly, performs parallel OSV queries, and uses background c
 
 Cerbe automatically detects vulnerable dependencies across your entire workspace.
 
-- **Automatic scanning when:**
+### Dependency scanning
 
-  - Opening a workspace with one or more `package.json` files
-  - Editing or saving:
-    - `package.json`
-    - `package-lock.json`
-    - `yarn.lock`
-    - `pnpm-lock.yaml`
-
-- **Direct dependency scanning**
-
-  Looks at:
-
+- Scans **every** `package.json` in your workspace (monorepo-friendly)
+- Checks:
   - `dependencies`
-  - `devDependencies`
-  - In _every_ `package.json` (monorepo-friendly)
+  - `devDependencies` (configurable)
+- Transitive dependencies are discovered via:
+  - `package-lock.json` (npm)
+  - `yarn.lock` (Yarn)
+  - `pnpm-lock.yaml` (pnpm)
 
-- **Transitive dependency scanning** from lockfiles:
+### Severity-aware analysis
 
-  - npm: `package-lock.json`
-  - Yarn: `yarn.lock`
-  - pnpm: `pnpm-lock.yaml`
+- Uses OSV `severity` (CVSS) information when available
+- Computes a **max severity** per package and per file
+- Shows severity level in:
+  - Diagnostics messages
+  - TreeView labels and tooltips
+- Visual severity prefixes:
+  - 🛑 Critical
+  - 🔴 High
+  - 🟠 Medium
+  - 🟡 Low
+  - ⚪️ Unknown
 
-- **OSV.dev API integration**
+### Sidebar TreeView (“Cerbe Vulnerabilities”)
 
-  Each `name@version` is checked against the OSV vulnerability database.
+Accessible from the Explorer view as **Cerbe Vulnerabilities**:
 
-- **Inline diagnostics**
+- **Level 1: Files**
+  - One node per `package.json` with issues
+  - Label includes relative path, issue count, and severity emoji
+- **Level 2: Packages**
+  - One node per vulnerable `package@version`
+  - Shows:
+    - Severity level
+    - Number of vulnerabilities
+    - Direct vs transitive
+    - For transitive deps, a “via …” chain (e.g. `via react > scheduler`)
+- **Level 3: Vulnerabilities**
+  - One node per OSV vulnerability ID
+  - Shows summary and severity
+  - Clicking opens the OSV vulnerability page in your browser
 
-  - Vulnerable direct dependencies show squiggles on their lines
-  - Transitive vulnerabilities attach to the top of the corresponding `package.json`
-  - Each vulnerability includes a direct link to the OSV entry
+Each package node lets you jump straight into the relevant `package.json` selection.
 
-- **Status bar integration**
+### Monorepo-aware lockfile mapping
 
-  - Shows scan progress (`Scanning…`)
-  - Displays total issue count
-  - Clickable to trigger a manual rescan
+- Lockfiles are associated with the **nearest** `package.json` up the directory tree
+- Transitive vulnerabilities discovered in lockfiles are attached to the correct project/package, even in large monorepos
+- Works across:
+  - Multiple apps/packages
+  - Multiple lockfiles per workspace
 
-- **Performance features**
+### Status bar integration
 
-  - Background caching per `name@version`
-  - Parallel OSV requests (batched)
-  - Efficient lockfile parsing
-  - Minimal noise, fast updates
+- Shows current status:
+  - Ready
+  - Scanning…
+  - Issue counts
+- Clickable to trigger a **manual rescan**
+
+### Smarter scanning behaviour
+
+- Automatic scanning is configurable:
+  - On workspace open
+  - On file changes
+  - Or manual only
+- Debounced scanning to avoid thrashing during installs or large edits
+- Parallel OSV queries with configurable concurrency
+- Background caching per `name@version` to avoid redundant network calls
 
 > **Notes**
 >
 > - Only NPM-ecosystem packages are checked (`ecosystem: "npm"`).
-> - Version parsing is best-effort.
-> - OSV.dev reports _known_ vulnerabilities—absence of a report does **not** guarantee safety.
+> - Version parsing is best-effort (focus on typical semver).
+> - OSV.dev reports _known_ vulnerabilities — absence of a report does **not** guarantee safety.
+
+---
+
+## ⚙️ Configuration
+
+All settings are under `cerbe` in the VS Code settings UI or `settings.json`.
+
+- `cerbe.autoScan`
+
+  - When Cerbe should automatically scan.
+  - Values:
+    - `"all"` – scan on workspace open and relevant file changes (default)
+    - `"onSave"` – reserved for future use (currently behaves like `"all"` for file changes)
+    - `"manual"` – only scan when you explicitly run the command or click the status bar item
+
+- `cerbe.scanTransitive`
+
+  - `true` / `false` (default: `true`)
+  - Enable or disable scanning of transitive dependencies via lockfiles.
+
+- `cerbe.maxConcurrency`
+
+  - Number (default: `10`)
+  - Maximum number of parallel OSV queries to run at once.
+
+- `cerbe.includeDevDependencies`
+
+  - `true` / `false` (default: `true`)
+  - Whether to include `devDependencies` when scanning.
+
+- `cerbe.excludeGlobs`
+  - Array of glob patterns (default: `[]`)
+  - Additional paths to exclude from scanning.
+  - `node_modules` is always excluded automatically; use this to ignore things like `**/examples/**` or `**/fixtures/**`.
 
 ---
 
@@ -74,12 +134,13 @@ Cerbe automatically detects vulnerable dependencies across your entire workspace
 
 Most of the time, Cerbe works automatically with zero setup.
 
-1. Open any folder containing one or more `package.json` files.
-2. Cerbe scans automatically and:
+1. Open a folder containing one or more `package.json` files.
+2. Cerbe scans automatically (depending on `cerbe.autoScan`) and:
 
-   - Updates the status bar (`Cerbe: …`)
-   - Adds warnings (squiggles) in each affected `package.json`
-   - Populates results in the **Problems** panel
+   - Updates the status bar with scan status and issue counts
+   - Adds diagnostics (squiggles) in each affected `package.json`
+   - Populates the **Problems** panel with all detected vulnerabilities
+   - Populates the **Cerbe Vulnerabilities** sidebar tree
 
 3. To manually trigger a scan:
 
@@ -87,11 +148,13 @@ Most of the time, Cerbe works automatically with zero setup.
    - Run: **Cerbe: Scan Dependencies**
    - Or click the Cerbe status bar item
 
-Then:
-
-- Check for warnings in your `package.json`
-- Open the Problems panel to see a full list of vulnerabilities
-- Click any diagnostic code to open the OSV vulnerability page
+4. To explore results visually:
+   - Open the **Explorer** view
+   - Find the **Cerbe Vulnerabilities** section
+   - Expand:
+     - File → Package → Vulnerability
+     - Click a package to jump into `package.json`
+     - Click a vulnerability node to open the OSV entry in your browser
 
 ---
 
@@ -99,14 +162,16 @@ Then:
 
 Cerbe sends **only**:
 
-- Package name (e.g., `lodash`)
-- Normalized version (e.g., `4.17.21`)
+- Package name (e.g. `lodash`)
+- Normalized version (e.g. `4.17.21`)
 
-To OSV.dev:
+To the OSV.dev API:
 
-https://api.osv.dev/v1/query
+- `https://api.osv.dev/v1/query`
 
-No file contents, paths, or project metadata are transmitted.
+No source code, file contents, or file paths are sent. The extension does not transmit any project metadata beyond the package name and version being checked.
+
+No tele
 
 ---
 
